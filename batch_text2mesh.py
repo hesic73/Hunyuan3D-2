@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import os
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import torch
 from loguru import logger
@@ -14,9 +13,9 @@ from hy3dgen.text2image import HunyuanDiTPipeline
 
 
 def _load_tasks(json_path: Path) -> List[Tuple[str, str]]:
-    """Load tasks from JSON file. 
-    JSON must be a dict: {name: prompt}.
-    Returns a list of (name, prompt) pairs sorted by name.
+    """Load tasks from a JSON file.
+    Expected format: {"name": "prompt", ...}.
+    Returns a list of (name, prompt) sorted by name.
     """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -26,14 +25,6 @@ def _load_tasks(json_path: Path) -> List[Tuple[str, str]]:
                    for k, v in data.items()], key=lambda x: x[0])
     assert len(items) > 0, "No tasks found in the input JSON"
     return items
-
-
-def _shard(items: List[Tuple[str, str]], num_shards: int) -> List[List[Tuple[str, str]]]:
-    """Split tasks into N shards in round-robin fashion for balanced GPU assignment."""
-    shards = [[] for _ in range(num_shards)]
-    for i, it in enumerate(items):
-        shards[i % num_shards].append(it)
-    return shards
 
 
 def _init_pipelines(
@@ -80,19 +71,19 @@ def _process_one(
 
 def _worker(
     gpu_id: int,
-    tasks: List[Tuple[str, str]],
+    tasks_queue,  # mp.Queue with (name, prompt) items
     out_root: Path,
     t2i_repo: str,
     t2mesh_repo: str,
     remove_background: bool,
     seed: int,
 ):
-    """Worker function to handle tasks on a single GPU."""
+    """Worker bound to a single GPU. It repeatedly pulls tasks from the shared queue."""
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
-    torch.manual_seed(seed)
+    torch.manual_seed(seed + gpu_id)
 
-    logger.info(f"[GPU {gpu_id}] #tasks = {len(tasks)}")
+    logger.info(f"[GPU {gpu_id}] starting")
     t2i, t2mesh, rembg = _init_pipelines(
         device=device,
         t2i_repo=t2i_repo,
@@ -100,10 +91,17 @@ def _worker(
         remove_background=remove_background,
     )
 
-    for name, prompt in tasks:
-        _process_one(name, prompt, out_root, t2i, t2mesh, rembg)
+    from queue import Empty
+    while True:
+        try:
+            name, prompt = tasks_queue.get_nowait()
+        except Empty:
+            break
 
-    logger.success(f"[GPU {gpu_id}] Done.")
+        _process_one(name, prompt, out_root, t2i, t2mesh, rembg)
+        torch.cuda.empty_cache()
+
+    logger.success(f"[GPU {gpu_id}] done.")
 
 
 def main(
@@ -114,50 +112,48 @@ def main(
     t2mesh_repo: str = "tencent/Hunyuan3D-2",
     remove_background: bool = True,
     seed: int = 42,
+    skip_existing: bool = True,
 ):
     """
-    Multi-GPU text2mesh inference script.
+    Multi-GPU text2mesh inference script with dynamic task dispatching.
 
     Args:
-        input_json: Path to JSON file mapping name -> prompt
-        output_dir: Root directory for results. Each mesh will be saved to output_dir/name/name.glb
-        gpus: List of GPU ids, e.g. [0,1,2].
+        input_json: Path to JSON mapping name -> prompt
+        output_dir: Root dir for results. Mesh -> output_dir/name/name.glb
+        gpus: List of GPU ids, e.g. [0,1,2]
         t2i_repo: Text-to-image model repo id
         t2mesh_repo: Text-to-mesh model repo id
         remove_background: Whether to remove background before mesh generation
         seed: Random seed for reproducibility
+        skip_existing: Skip tasks whose .glb already exists
     """
     out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
     items = _load_tasks(input_json)
-
     assert len(gpus) > 0, "No GPUs provided"
-    logger.info(f"Using GPUs: {gpus}")
 
-    shards = _shard(items, len(gpus))
-
-    # Single GPU mode (no multiprocessing needed)
-    if len(gpus) == 1:
-        _worker(
-            gpu_id=gpus[0],
-            tasks=shards[0],
-            out_root=out_root,
-            t2i_repo=t2i_repo,
-            t2mesh_repo=t2mesh_repo,
-            remove_background=remove_background,
-            seed=seed,
-        )
-        return
-
-    # Multi-GPU mode: spawn one process per GPU
     import multiprocessing as mp
     ctx = mp.get_context("spawn")
+    tasks_queue = ctx.Queue()
+
+    skipped = 0
+    for name, prompt in items:
+        mesh_path = out_root / name / f"{name}.glb"
+        if skip_existing and mesh_path.exists():
+            logger.info(f"Skipping [{name}] (already exists: {mesh_path})")
+            skipped += 1
+            continue
+        tasks_queue.put((name, prompt))
+
+    logger.info(
+        f"GPUs: {gpus} | total tasks: {len(items)} | queued: {tasks_queue.qsize()} | skipped: {skipped}")
+
     procs = []
-    for gpu_id, tasks in zip(gpus, shards):
+    for gpu_id in gpus:
         p = ctx.Process(
             target=_worker,
-            args=(gpu_id, tasks, out_root, t2i_repo,
+            args=(gpu_id, tasks_queue, out_root, t2i_repo,
                   t2mesh_repo, remove_background, seed),
         )
         p.daemon = False
