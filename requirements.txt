@@ -38,3 +38,7 @@ rembg
 onnxruntime
 #gevent
 #geventhttpclient
+
+sentencepiece
+loguru
+tyro
